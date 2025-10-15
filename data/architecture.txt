@@ -1,0 +1,10 @@
+System architecture:
+
+The application has three main layers:
+1. The Frontend (Gradio interface) for chatting with the agent.
+2. The Middleware (Agent Loop) which coordinates reasoning and tool calls.
+3. The Backend (Tools + Local RAG Index).
+
+Each layer communicates using message passing.
+The agent core maintains an internal scratchpad for reasoning.
+All tools are stateless and return structured JSON objects.

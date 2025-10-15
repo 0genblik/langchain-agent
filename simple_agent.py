@@ -22,6 +22,7 @@ load_dotenv()
 
 # define RAG constants
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDER = SentenceTransformer(EMBED_MODEL_NAME)
 INDEX_PATH = "chunks.index"
 CHUNKS_PATH = "chunks.pkl"
 
@@ -68,7 +69,79 @@ def minimal_chain(client: GeminiClient, question: str) -> str:
     response = client.invoke_with_retry(msgs)
     return response.content
 
-# 3. Tools 
+
+# 3. RAG integration 
+# LLMs have limitations - training data might be outdated, or they might not know niche topics.
+# Precise *factual* detail -> often hallucinates.
+# Models don't know our private information.
+# We could put this information into the prompt - it doesn't scale. 
+
+# RAG := retrieval-augmented generation
+# 1. Query arrives
+# 2. System retrieves from a vector index the top-k relevant document chunks
+# 3. Retrieved text is "context injected" into the prompt to the model.
+# 4. Model generated an answer *grounded* in the retrieved text. 
+
+# => less likely to hallucinate
+# => answer questions about private data
+
+def load_documents(folder: str) -> List[Dict[str, Any]]:
+    docs = []
+    for p in Path(folder).iterdir():
+        if p.suffix.lower() in {".txt", ".md"}:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+            docs.append({"doc_id": str(p), "text": text, "meta": {"source": str(p)}})
+        elif p.suffix.lower() == ".pdf":
+            # For simplicity, we skip PDF parsing in this example
+            continue
+        elif p.suffix.lower() == ".csv":
+            # For simplicity, we skip CSV parsing in this example
+            continue
+        elif p.suffix.lower() == ".json":
+            # For simplicity, we skip JSON parsing in this example
+            continue
+    return docs
+    
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
+    tokens = text.split()
+    chunks = []
+    i = 0
+    while i < len(tokens):
+        chunk = tokens[i:i+chunk_size]
+        chunks.append(" ".join(chunk))
+        i += max(1, chunk_size - overlap)
+    return chunks
+
+def build_or_load_index(docs_folder: str):
+    if Path(INDEX_PATH).exists() and Path(CHUNKS_PATH).exists():
+        # Load existing index and chunks
+        index = faiss.read_index(INDEX_PATH)
+        with open(CHUNKS_PATH, "rb") as f:
+            chunks = pickle.load(f)
+        return index, chunks
+
+    docs = load_documents(docs_folder)
+    all_chunks = []
+    for doc in docs:
+        cks = chunk_text(doc["text"])
+        for i, ck in enumerate(cks):
+            all_chunks.append({"chunk_id": f"{doc['doc_id']}_chunk_{i}", "text": ck, "meta": doc["meta"]})
+    
+    embeddings = EMBEDDER.encode([c["text"] for c in all_chunks], convert_to_numpy=True, show_progress_bar=True)
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(embeddings)
+
+    # save index and chunks
+    faiss.write_index(index, INDEX_PATH)
+    with open(CHUNKS_PATH, "wb") as f:
+        pickle.dump(all_chunks, f)
+
+    return index, all_chunks
+
+index, all_chunks = build_or_load_index("data")
+
+# 4. Tools 
 
 # @tool
 # def search_web(query: str) -> str:
@@ -148,8 +221,35 @@ def wiki_lookup(topic: str) -> str:
         print(error_msg)
         print("=====================================================")
         return error_msg
+    
 
-# 4. Agent loop with tools - ReAct style
+
+@tool
+def retrieve_relevant_docs(query: str, k: int = 3) -> List[Dict[str, Any]]:
+    """
+    Retrieve the top-k most relevant document chunks for a query using a FAISS vector index.
+    
+    Args:
+        query (str): The search query.
+        k (int): The number of top relevant documents to retrieve.
+    Returns:
+        List[Dict[str, Any]]: A list of the top-k relevant document chunks with their metadata.
+    """
+    print("=====================================================")
+    print(f"Retrieving top {k} relevant documents for query: {query}")
+    q = EMBEDDER.encode([query], convert_to_numpy=True)
+    D, I = index.search(q, k)
+    results = []
+    for score, idx in zip(D[0], I[0]):
+        ch = all_chunks[int(idx)]
+        results.append({"chunk_id": ch["chunk_id"], "text": ch["text"], "meta": ch["meta"], "score": float(score)})
+
+    print(f"Top {k} relevant documents: {results}")
+    print("=====================================================")
+    return results
+
+
+# 5. Agent loop with tools - ReAct style
 class AgentLoop:
     def __init__(self, client: GeminiClient, tools: List[Any], max_steps: int = 10):
         self.client = client
@@ -160,7 +260,7 @@ class AgentLoop:
     def run(self, user_message: str) -> str:
         """Run the agent loop until a final answer is produced or max steps reached."""
         messages: List[Any] = [
-            SystemMessage(content="You are a helpful agent. You should call tools when needed. If you call a tool, output a JSON specifying tool name and arguments. Otherwise, output a final answer."),
+            SystemMessage(content="You are a helpful agent. You should call tools when needed. Always retrieve relevant documentation first, and only if the results are poor matches should you call another tool, e.g. search. If you call a tool, output a JSON specifying tool name and arguments. Otherwise, output a final answer."),
             HumanMessage(content=user_message)
         ]
 
@@ -197,67 +297,15 @@ class AgentLoop:
         return "I couldn't complete the task within the allowed steps."
 
 
-# 5. RAG integration 
-# LLMs have limitations - training data might be outdated, or they might not know niche topics.
-# Precise *factual* detail -> often hallucinates.
-# Models don't know our private information.
-# We could put this information into the prompt - it doesn't scale. 
-
-# RAG := retrieval-augmented generation
-# 1. Query arrives
-# 2. System retrieves from a vector index the top-k relevant document chunks
-# 3. Retrieved text is "context injected" into the prompt to the model.
-# 4. Model generated an answer *grounded* in the retrieved text. 
-
-# => less likely to hallucinate
-# => answer questions about private data
-
-def load_documents(folder: str) -> List[Dict[str, Any]]:
-    docs = []
-    for p in Path(folder).iterdir():
-        if p.suffix.lower() in {".txt", ".md"}:
-            text = p.read_text(encoding="utf-8", errors="ignore")
-            docs.append({"doc_id": str(p), "text": text, "meta": {"source": str(p)}})
-        elif p.suffix.lower() == ".pdf":
-            # For simplicity, we skip PDF parsing in this example
-            continue
-        elif p.suffix.lower() == ".csv":
-            # For simplicity, we skip CSV parsing in this example
-            continue
-        elif p.suffix.lower() == ".json":
-            # For simplicity, we skip JSON parsing in this example
-            continue
-    return docs
-    
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
-    tokens = text.split()
-    chunks = []
-    i = 0
-    while i < len(tokens):
-        chunk = tokens[i:i+chunk_size]
-        chunks.append(" ".join(chunk))
-        i += max(1, chunk_size - overlap)
-    return chunks
-
-def build_or_load_index(doc_folder: str):
-    if Path()
-    
-
-def retrieve_relevant_docs(): 
-    pass
-
-
-
-
-
 # Run 
 if __name__ == "__main__":
     client = GeminiClient()
-    question = "Who was Alan Turing and where was he born?"
+
+    question = "Tell me about principles of agentic behaviour."
 
     print("Minimal chain response:")
     print(minimal_chain(client, question))
 
-    agent = AgentLoop(client, tools=[tavily_search_tool, wiki_lookup])
+    agent = AgentLoop(client, tools=[wiki_lookup, retrieve_relevant_docs])
     print("Agent loop response:")
     print(agent.run(question))
