@@ -12,11 +12,19 @@ from sentence_transformers import SentenceTransformer
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
 from langchain_core.tools import tool 
+from langchain_tavily import TavilySearch
+
 import gradio as gr # UI/frontend library 
 
 # load api key with dotenv
 from dotenv import load_dotenv
 load_dotenv()
+
+# define RAG constants
+EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+INDEX_PATH = "chunks.index"
+CHUNKS_PATH = "chunks.pkl"
+
 
 # 1. Gemini client with throttle + retry 
 class GeminiClient:
@@ -61,41 +69,87 @@ def minimal_chain(client: GeminiClient, question: str) -> str:
     return response.content
 
 # 3. Tools 
+
+# @tool
+# def search_web(query: str) -> str:
+#     """
+#     Search the web for a query using DuckDuckGo Instant Answer API and return a summary.
+    
+#     Args:
+#         query (str): The search query.
+#     Returns:
+#         str: A summary of the search results.
+#     """
+#     print("=====================================================")
+#     print(f"Searching the web for: {query}")
+#     url = "https://api.duckduckgo.com/"
+#     params = {
+#         "q": query,
+#         "format": "json",
+#         "t": "langchain_agent",
+#     }
+#     r = requests.get(url, params=params, timeout=10)
+#     print(r)
+#     r.raise_for_status()
+#     data = r.json()
+#     print(f"Search results: {data}")
+#     print("=====================================================")
+#     summary = data.get("AbstractText") or ""
+#     if not summary:
+#         rel = data.get("RelatedTopics") or []
+#         if rel and isinstance(rel, list):
+#             first = rel[0]
+#             if isinstance(first, dict):
+#                 summary = first.get("Text") or ""
+#                 summary = summary[:500] + " (See more at: " + first.get("FirstURL", "") + ")"
+#     return summary or "No relevant information found."
+
+
+tavily_search_tool = TavilySearch(
+    max_results=5,
+    topic="general",
+)
+
 @tool
-def search_web(query: str) -> str:
+def wiki_lookup(topic: str) -> str:
     """
-    Search the web for a query using DuckDuckGo Instant Answer API and return a summary.
+    Get the first paragraph from Wikipedia for a given topic.
     
     Args:
-        query (str): The search query.
+        topic (str): The Wikipedia topic to look up. You should use underscores for spaces.
     Returns:
-        str: A summary of the search results.
+        str: The first paragraph of the Wikipedia article or an error message.
     """
-    print(f"Searching the web for: {query}")
-    url = "https://api.duckduckgo.com/"
-    params = {
-        "q": query,
-        "format": "json",
-        "no_redirect": 1,
-        "skip_disambig": 1,
-        "t": "open_agent",
+    print("=====================================================")
+    print(f"Looking up Wikipedia for: {topic}")
+    url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{topic}"
+    # Add User-Agent header to prevent 403 errors
+    headers = {
+        "User-Agent": "LangchainAgent/1.0 (https://github.com/0genblik/langchain-agent)"
     }
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    summary = data.get("AbstractText") or ""
-    if not summary:
-        rel = data.get("RelatedTopics") or []
-        if rel and isinstance(rel, list):
-            first = rel[0]
-            if isinstance(first, dict):
-                summary = first.get("Text") or ""
-                summary = summary[:500] + " (See more at: " + first.get("FirstURL", "") + ")"
-    return summary or "No relevant information found."
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()  # Raises exception for 4XX/5XX responses
+        data = r.json()
+        print(f"Wikipedia data: {data}")
+        print("=====================================================")
+        return data.get("extract", "No summary available.")
+    except requests.exceptions.HTTPError as e:
+        error_msg = f"Wikipedia lookup failed with status code {e.response.status_code}"
+        if e.response.status_code == 403:
+            error_msg += ". This could be due to rate limiting or request blocking."
+        elif e.response.status_code == 404:
+            error_msg += f". The topic '{topic}' might not exist on Wikipedia."
+        print(error_msg)
+        print("=====================================================")
+        return error_msg
+    except Exception as e:
+        error_msg = f"Wikipedia lookup failed: {str(e)}"
+        print(error_msg)
+        print("=====================================================")
+        return error_msg
 
-
-
-# 4. Agent loop with tools 
+# 4. Agent loop with tools - ReAct style
 class AgentLoop:
     def __init__(self, client: GeminiClient, tools: List[Any], max_steps: int = 10):
         self.client = client
@@ -135,10 +189,63 @@ class AgentLoop:
                 continue
             
             # no tool calls, final answer:
+            print("=====================================================")
             print(f"Message history: {messages}")
-            return ai.content
+            print("=====================================================")
+            return str(ai.content)
         
         return "I couldn't complete the task within the allowed steps."
+
+
+# 5. RAG integration 
+# LLMs have limitations - training data might be outdated, or they might not know niche topics.
+# Precise *factual* detail -> often hallucinates.
+# Models don't know our private information.
+# We could put this information into the prompt - it doesn't scale. 
+
+# RAG := retrieval-augmented generation
+# 1. Query arrives
+# 2. System retrieves from a vector index the top-k relevant document chunks
+# 3. Retrieved text is "context injected" into the prompt to the model.
+# 4. Model generated an answer *grounded* in the retrieved text. 
+
+# => less likely to hallucinate
+# => answer questions about private data
+
+def load_documents(folder: str) -> List[Dict[str, Any]]:
+    docs = []
+    for p in Path(folder).iterdir():
+        if p.suffix.lower() in {".txt", ".md"}:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+            docs.append({"doc_id": str(p), "text": text, "meta": {"source": str(p)}})
+        elif p.suffix.lower() == ".pdf":
+            # For simplicity, we skip PDF parsing in this example
+            continue
+        elif p.suffix.lower() == ".csv":
+            # For simplicity, we skip CSV parsing in this example
+            continue
+        elif p.suffix.lower() == ".json":
+            # For simplicity, we skip JSON parsing in this example
+            continue
+    return docs
+    
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
+    tokens = text.split()
+    chunks = []
+    i = 0
+    while i < len(tokens):
+        chunk = tokens[i:i+chunk_size]
+        chunks.append(" ".join(chunk))
+        i += max(1, chunk_size - overlap)
+    return chunks
+
+def build_or_load_index(doc_folder: str):
+    if Path()
+    
+
+def retrieve_relevant_docs(): 
+    pass
+
 
 
 
@@ -146,11 +253,11 @@ class AgentLoop:
 # Run 
 if __name__ == "__main__":
     client = GeminiClient()
-    question = "What is the population of Paris? Give the most up-to-date answer you can find."
+    question = "Who was Alan Turing and where was he born?"
 
     print("Minimal chain response:")
     print(minimal_chain(client, question))
 
-    agent = AgentLoop(client, tools=[search_web])
+    agent = AgentLoop(client, tools=[tavily_search_tool, wiki_lookup])
     print("Agent loop response:")
     print(agent.run(question))
